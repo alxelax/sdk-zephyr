@@ -29,6 +29,7 @@
 
 #include <zephyr/logging/log.h>
 #include "mesh/rpr.h"
+#include "mesh/testing.h"
 
 LOG_MODULE_REGISTER(LOG_MODULE_NAME);
 
@@ -1750,6 +1751,411 @@ static void test_device_pb_remote_server_ncrp_second_time(void)
 }
 #endif /* IS_RPR_PRESENT */
 
+/* Hardcoded fake confirmation value for invalid confirm test.
+ * "e6e7311582b93e8a252c7587d8941ddd61cbbd4437637e18d2472c168ecbfe2c"
+ */
+static const uint8_t fake_confirm_val[32] = {
+	0xe6, 0xe7, 0x31, 0x15, 0x82, 0xb9, 0x3e, 0x8a,
+	0x25, 0x2c, 0x75, 0x87, 0xd8, 0x94, 0x1d, 0xdd,
+	0x61, 0xcb, 0xbd, 0x44, 0x37, 0x63, 0x7e, 0x18,
+	0xd2, 0x47, 0x2c, 0x16, 0x8e, 0xcb, 0xfe, 0x2c
+};
+
+/* Dummy UUID that no device will match, used to stop the provisioner
+ * from reacting to unprovisioned beacons after an intentional failure.
+ */
+static uint8_t dummy_uuid[16] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+				 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+
+/* Custom link_close for the invalid-confirm test.  After the expected failure
+ * the provisionee will re-enable unprovisioned beacons.  We must set
+ * uuid_to_provision to a dummy so the provisioner does not attempt to provision
+ * the device again.
+ */
+static void prov_link_close_invalid_confirm(bt_mesh_prov_bearer_t bearer)
+{
+	link_close_timestamp = k_uptime_get_32();
+	uuid_to_provision = dummy_uuid;
+}
+
+/** @brief Provisionee: expect provisioning to fail because provisioner sent a
+ *  Confirmation PDU out-of-sequence (right after Capabilities exchange).
+ *
+ *  The provisionee expects PROV_START at that point, so it will reject the
+ *  frame with PROV_ERR_UNEXP_PDU and close the link.  Then a second, valid
+ *  provisioning attempt must succeed.
+ */
+static void test_device_confirm_after_caps(void)
+{
+	k_sem_init(&prov_sem, 0, 1);
+
+	bt_mesh_device_setup(&prov, &comp);
+	ASSERT_OK(bt_mesh_prov_enable(BT_MESH_PROV_ADV));
+
+	LOG_INF("Mesh initialized, waiting for provisioning (expecting failure)...\n");
+
+	/* Provisioning should fail: provisioner will send CONFIRM before START.
+	 * The provisionee replies with PROV_FAILED and waits for link close.
+	 * prov_reset callback will re-enable beacons automatically.
+	 */
+	int err = k_sem_take(&prov_sem, K_SECONDS(30));
+
+	ASSERT_EQUAL(-EAGAIN, err);
+	LOG_INF("Provisioning correctly failed (unexpected PDU expected)\n");
+
+	/* Wait for the second provisioning attempt that uses the normal flow. */
+	LOG_INF("Waiting for valid provisioning attempt...\n");
+	ASSERT_OK(k_sem_take(&prov_sem, K_SECONDS(30)));
+	LOG_INF("Provisioning succeeded after previous failure\n");
+
+	PASS();
+}
+
+/** @brief Provisioner: send a Confirmation PDU immediately after receiving
+ *  Capabilities (out-of-sequence), then retry provisioning normally.
+ *
+ *  The provisioner sets the \c bt_mesh_prov_test_send_confirm_on_caps hook so
+ *  that send_confirm() is called from prov_capabilities() before any START or
+ *  public-key exchange has taken place.  The provisionee should reject this
+ *  with PROV_ERR_UNEXP_PDU.  After the failed attempt the hook is cleared and
+ *  a normal provisioning run must succeed.
+ */
+static void test_provisioner_confirm_after_caps(void)
+{
+	k_sem_init(&prov_sem, 0, 1);
+
+	/* Prevent the provisioner from re-provisioning after the expected failure. */
+	prov.link_close = prov_link_close_invalid_confirm;
+
+	bt_mesh_device_setup(&prov, &comp);
+
+	ASSERT_OK(bt_mesh_cdb_create(test_net_key));
+
+	ASSERT_OK(bt_mesh_provision(test_net_key, 0, 0, 0, 0x0001, dev_key));
+
+	/* Enable out-of-sequence confirm hook */
+	bt_mesh_prov_test_send_confirm_on_caps = true;
+
+	LOG_INF("Provisioner started with confirm-after-caps hook enabled\n");
+
+	/* Provisioning should NOT succeed. */
+	int err = k_sem_take(&prov_sem, K_SECONDS(30));
+
+	ASSERT_EQUAL(-EAGAIN, err);
+	LOG_INF("Provisioning correctly failed (provisionee rejected out-of-sequence confirm)\n");
+
+	/* Disable the hook and restore defaults for the retry. */
+	bt_mesh_prov_test_send_confirm_on_caps = false;
+	prov.link_close = prov_link_close;
+	uuid_to_provision = NULL;
+
+	LOG_INF("Retrying provisioning with normal flow...\n");
+
+	ASSERT_OK(k_sem_take(&prov_sem, K_SECONDS(30)));
+	LOG_INF("Provisioning succeeded after previous failure\n");
+
+	PASS();
+}
+
+/** @brief Provisionee: expect provisioning to fail due to out-of-sequence Confirmation
+ *  injected right after Start (before public key exchange).
+ *
+ *  Provisionee expects PUB_KEY after receiving Start.  Getting CONFIRM at that
+ *  point triggers PROV_ERR_UNEXP_PDU.  A second, normal attempt then succeeds.
+ */
+static void test_device_confirm_after_start(void)
+{
+	k_sem_init(&prov_sem, 0, 1);
+
+	bt_mesh_device_setup(&prov, &comp);
+	ASSERT_OK(bt_mesh_prov_enable(BT_MESH_PROV_ADV));
+
+	LOG_INF("Mesh initialized, waiting for provisioning (expecting failure)...\n");
+
+	int err = k_sem_take(&prov_sem, K_SECONDS(30));
+
+	ASSERT_EQUAL(-EAGAIN, err);
+	LOG_INF("Provisioning correctly failed (CONFIRM instead of PUB_KEY)\n");
+
+	LOG_INF("Waiting for valid provisioning attempt...\n");
+	ASSERT_OK(k_sem_take(&prov_sem, K_SECONDS(30)));
+	LOG_INF("Provisioning succeeded after previous failure\n");
+
+	PASS();
+}
+
+/** @brief Provisioner: inject Confirmation right after sending Start.
+ *
+ *  Sets bt_mesh_prov_test_send_confirm_on_start so that start_sent() sends a
+ *  raw CONFIRM PDU instead of the provisioner's public key.  The provisionee
+ *  expects PUB_KEY and rejects the CONFIRM with PROV_ERR_UNEXP_PDU.  After
+ *  the failure the hook is cleared and provisioning retries normally.
+ */
+static void test_provisioner_confirm_after_start(void)
+{
+	k_sem_init(&prov_sem, 0, 1);
+
+	prov.link_close = prov_link_close_invalid_confirm;
+
+	bt_mesh_device_setup(&prov, &comp);
+
+	ASSERT_OK(bt_mesh_cdb_create(test_net_key));
+
+	ASSERT_OK(bt_mesh_provision(test_net_key, 0, 0, 0, 0x0001, dev_key));
+
+	bt_mesh_prov_test_send_confirm_on_start = true;
+
+	LOG_INF("Provisioner started with confirm-after-start hook enabled\n");
+
+	int err = k_sem_take(&prov_sem, K_SECONDS(30));
+
+	ASSERT_EQUAL(-EAGAIN, err);
+	LOG_INF("Provisioning correctly failed (provisionee rejected CONFIRM when expecting PUB_KEY)\n");
+
+	bt_mesh_prov_test_send_confirm_on_start = false;
+	prov.link_close = prov_link_close;
+	uuid_to_provision = NULL;
+
+	LOG_INF("Retrying provisioning with normal flow...\n");
+
+	ASSERT_OK(k_sem_take(&prov_sem, K_SECONDS(30)));
+	LOG_INF("Provisioning succeeded after previous failure\n");
+
+	PASS();
+}
+
+/** @brief Provisionee: expect provisioning to fail when provisioner sends a
+ *  second Confirmation PDU (double-confirm) instead of Random.
+ *
+ *  After both sides exchange confirmations the provisionee expects RANDOM.
+ *  Receiving CONFIRM again triggers PROV_ERR_UNEXP_PDU.  A second, normal
+ *  attempt then succeeds.
+ */
+static void test_device_double_confirm(void)
+{
+	k_sem_init(&prov_sem, 0, 1);
+
+	bt_mesh_device_setup(&prov, &comp);
+	ASSERT_OK(bt_mesh_prov_enable(BT_MESH_PROV_ADV));
+
+	LOG_INF("Mesh initialized, waiting for provisioning (expecting failure)...\n");
+
+	int err = k_sem_take(&prov_sem, K_SECONDS(30));
+
+	ASSERT_EQUAL(-EAGAIN, err);
+	LOG_INF("Provisioning correctly failed (CONFIRM instead of RANDOM)\n");
+
+	LOG_INF("Waiting for valid provisioning attempt...\n");
+	ASSERT_OK(k_sem_take(&prov_sem, K_SECONDS(30)));
+	LOG_INF("Provisioning succeeded after previous failure\n");
+
+	PASS();
+}
+
+/** @brief Provisioner: send a second Confirmation PDU instead of Random.
+ *
+ *  Sets bt_mesh_prov_test_double_confirm so that prov_confirm() (provisioner's
+ *  handler for receiving the provisionee's Confirmation) sends a raw CONFIRM
+ *  instead of calling send_random().  The provisionee expects RANDOM and
+ *  rejects the second CONFIRM with PROV_ERR_UNEXP_PDU.  After the failure
+ *  the hook is cleared and provisioning retries normally.
+ */
+static void test_provisioner_double_confirm(void)
+{
+	k_sem_init(&prov_sem, 0, 1);
+
+	prov.link_close = prov_link_close_invalid_confirm;
+
+	bt_mesh_device_setup(&prov, &comp);
+
+	ASSERT_OK(bt_mesh_cdb_create(test_net_key));
+
+	ASSERT_OK(bt_mesh_provision(test_net_key, 0, 0, 0, 0x0001, dev_key));
+
+	bt_mesh_prov_test_double_confirm = true;
+
+	LOG_INF("Provisioner started with double-confirm hook enabled\n");
+
+	int err = k_sem_take(&prov_sem, K_SECONDS(30));
+
+	ASSERT_EQUAL(-EAGAIN, err);
+	LOG_INF("Provisioning correctly failed (provisionee rejected CONFIRM when expecting RANDOM)\n");
+
+	bt_mesh_prov_test_double_confirm = false;
+	prov.link_close = prov_link_close;
+	uuid_to_provision = NULL;
+
+	LOG_INF("Retrying provisioning with normal flow...\n");
+
+	ASSERT_OK(k_sem_take(&prov_sem, K_SECONDS(30)));
+	LOG_INF("Provisioning succeeded after previous failure\n");
+
+	PASS();
+}
+
+/** @brief Provisionee: expect provisioning to fail when provisioner sends
+ *  Confirmation instead of Provisioning Data after a full Random exchange.
+ *
+ *  After the full Confirmation+Random exchange completes successfully the
+ *  provisionee expects Provisioning Data.  Receiving CONFIRM at that point
+ *  triggers PROV_ERR_UNEXP_PDU.  A second, normal attempt then succeeds.
+ */
+static void test_device_confirm_instead_of_data(void)
+{
+	k_sem_init(&prov_sem, 0, 1);
+
+	bt_mesh_device_setup(&prov, &comp);
+	ASSERT_OK(bt_mesh_prov_enable(BT_MESH_PROV_ADV));
+
+	LOG_INF("Mesh initialized, waiting for provisioning (expecting failure)...\n");
+
+	int err = k_sem_take(&prov_sem, K_SECONDS(30));
+
+	ASSERT_EQUAL(-EAGAIN, err);
+	LOG_INF("Provisioning correctly failed (CONFIRM instead of DATA)\n");
+
+	LOG_INF("Waiting for valid provisioning attempt...\n");
+	ASSERT_OK(k_sem_take(&prov_sem, K_SECONDS(30)));
+	LOG_INF("Provisioning succeeded after previous failure\n");
+
+	PASS();
+}
+
+/** @brief Provisioner: send Confirmation PDU instead of Provisioning Data.
+ *
+ *  Sets bt_mesh_prov_test_send_confirm_on_data so that prov_random()
+ *  (provisioner's handler for receiving the provisionee's Random) sends a
+ *  raw CONFIRM instead of calling send_prov_data().  The full
+ *  Confirmation+Random exchange proceeds with real crypto; only the final
+ *  step is hijacked.  The provisionee expects Provisioning Data and rejects
+ *  the CONFIRM with PROV_ERR_UNEXP_PDU.  After the failure the hook is
+ *  cleared and provisioning retries normally.
+ */
+static void test_provisioner_confirm_instead_of_data(void)
+{
+	k_sem_init(&prov_sem, 0, 1);
+
+	prov.link_close = prov_link_close_invalid_confirm;
+
+	bt_mesh_device_setup(&prov, &comp);
+
+	ASSERT_OK(bt_mesh_cdb_create(test_net_key));
+
+	ASSERT_OK(bt_mesh_provision(test_net_key, 0, 0, 0, 0x0001, dev_key));
+
+	/* No bt_mesh_prov_test_confirm_val override — use the real confirmation
+	 * so that the Confirmation+Random exchange can succeed cryptographically
+	 * before the hook fires at the Data stage.
+	 */
+	bt_mesh_prov_test_send_confirm_on_data = true;
+
+	LOG_INF("Provisioner started with confirm-instead-of-data hook enabled\n");
+
+	int err = k_sem_take(&prov_sem, K_SECONDS(30));
+
+	ASSERT_EQUAL(-EAGAIN, err);
+	LOG_INF("Provisioning correctly failed (provisionee rejected CONFIRM when expecting DATA)\n");
+
+	bt_mesh_prov_test_send_confirm_on_data = false;
+	prov.link_close = prov_link_close;
+	uuid_to_provision = NULL;
+
+	LOG_INF("Retrying provisioning with normal flow...\n");
+
+	ASSERT_OK(k_sem_take(&prov_sem, K_SECONDS(30)));
+	LOG_INF("Provisioning succeeded after previous failure\n");
+
+	PASS();
+}
+
+/** @brief Provisionee: expect provisioning to fail due to invalid confirmation
+ *
+ *  The provisionee starts normally and waits for provisioning. The provisioner
+ *  will send a hardcoded (invalid) confirmation value. When the provisionee
+ *  receives the provisioner's random, it should detect the confirmation mismatch
+ *  and abort provisioning with PROV_ERR_CFM_FAILED.
+ */
+static void test_device_invalid_confirm(void)
+{
+	k_sem_init(&prov_sem, 0, 1);
+
+	bt_mesh_device_setup(&prov, &comp);
+	ASSERT_OK(bt_mesh_prov_enable(BT_MESH_PROV_ADV));
+
+	LOG_INF("Mesh initialized, waiting for provisioning (expecting failure)...\n");
+
+	/* Provisioning should NOT complete successfully. Wait for the link to close.
+	 * prov_reset callback will re-enable beacons automatically.
+	 */
+	int err = k_sem_take(&prov_sem, K_SECONDS(30));
+
+	ASSERT_EQUAL(-EAGAIN, err);
+	LOG_INF("Provisioning correctly did not complete (confirmation mismatch expected)\n");
+
+	/* Now wait for the second provisioning attempt that uses a valid
+	 * confirmation.  The provisionee is already advertising unprovisioned
+	 * beacons (prov_reset re-enabled them), so no extra action is needed.
+	 */
+	LOG_INF("Waiting for valid provisioning attempt...\n");
+	ASSERT_OK(k_sem_take(&prov_sem, K_SECONDS(30)));
+	LOG_INF("Provisioning succeeded after previous failure\n");
+
+	PASS();
+}
+
+/** @brief Provisioner: send hardcoded (invalid) confirmation value, then continue as usual.
+ *
+ *  The provisioner sets the test hook to override the confirmation PDU with a
+ *  hardcoded value, then starts provisioning. The provisionee should detect
+ *  the mismatch and send PROV_FAILED, causing the link to close.
+ */
+static void test_provisioner_invalid_confirm(void)
+{
+	k_sem_init(&prov_sem, 0, 1);
+
+	/* Use a custom link_close callback that prevents the provisioner from
+	 * re-provisioning after the expected failure.
+	 */
+	prov.link_close = prov_link_close_invalid_confirm;
+
+	bt_mesh_device_setup(&prov, &comp);
+
+	ASSERT_OK(bt_mesh_cdb_create(test_net_key));
+
+	ASSERT_OK(bt_mesh_provision(test_net_key, 0, 0, 0, 0x0001, dev_key));
+
+	/* Set the test hook to override the confirmation value */
+	bt_mesh_prov_test_confirm_val = fake_confirm_val;
+
+	LOG_INF("Provisioner started with invalid confirm override\n");
+
+	/* Provisioning should NOT succeed: provisionee will reject the bad confirmation.
+	 * The node_added callback (which gives prov_sem) should not fire.
+	 */
+	int err = k_sem_take(&prov_sem, K_SECONDS(30));
+
+	ASSERT_EQUAL(-EAGAIN, err);
+	LOG_INF("Provisioning correctly failed (provisionee rejected invalid confirmation)\n");
+
+	/* Disable the test hook so the next attempt uses the real confirmation.
+	 * Restore defaults and allow the provisioner to pick up beacons again.
+	 */
+	bt_mesh_prov_test_confirm_val = NULL;
+	prov.link_close = prov_link_close;
+	uuid_to_provision = NULL;
+
+	LOG_INF("Retrying provisioning with valid confirmation...\n");
+
+	/* The provisionee is already advertising unprovisioned beacons.
+	 * The unprovisioned_beacon callback will call provision() automatically.
+	 * Now provisioning should complete successfully.
+	 */
+	ASSERT_OK(k_sem_take(&prov_sem, K_SECONDS(30)));
+	LOG_INF("Provisioning succeeded after previous failure\n");
+
+	PASS();
+}
+
 #define TEST_CASE(role, name, description)                                     \
 	{                                                                      \
 		.test_id = "prov_" #role "_" #name, .test_descr = description, \
@@ -1818,6 +2224,26 @@ static const struct bst_test_instance test_connect[] = {
 	TEST_CASE(provisioner, pb_remote_client_provision_timeout,
 		  "Provisioner: provisioning test, devices stop responding"),
 #endif
+	TEST_CASE(device, confirm_after_caps,
+		  "Device: provisioning fails due to out-of-sequence confirmation from provisioner"),
+	TEST_CASE(provisioner, confirm_after_caps,
+		  "Provisioner: sends confirmation PDU right after receiving capabilities"),
+	TEST_CASE(device, confirm_after_start,
+		  "Device: provisioning fails, CONFIRM injected right after Start (expects PUB_KEY)"),
+	TEST_CASE(provisioner, confirm_after_start,
+		  "Provisioner: injects CONFIRM right after Start, before public key exchange"),
+	TEST_CASE(device, double_confirm,
+		  "Device: provisioning fails, CONFIRM received instead of RANDOM (double-confirm)"),
+	TEST_CASE(provisioner, double_confirm,
+		  "Provisioner: sends second CONFIRM instead of Random after confirm exchange"),
+	TEST_CASE(device, confirm_instead_of_data,
+		  "Device: provisioning fails, CONFIRM received instead of Provisioning Data"),
+	TEST_CASE(provisioner, confirm_instead_of_data,
+		  "Provisioner: sends CONFIRM instead of Data after full Random exchange"),
+	TEST_CASE(device, invalid_confirm,
+		  "Device: provisioning fails due to invalid confirmation from provisioner"),
+	TEST_CASE(provisioner, invalid_confirm,
+		  "Provisioner: sends hardcoded invalid confirmation value"),
 
 	BSTEST_END_MARKER
 };
@@ -1849,12 +2275,58 @@ static const struct bst_test_instance test_connect_pst[] = {
 	TEST_CASE(provisioner, pb_remote_client_ncrp_second_time,
 		  "Provisioner: NCRP test, initiates NCR procedure the second time."),
 
+	TEST_CASE(device, confirm_after_caps,
+		  "Device: provisioning fails due to out-of-sequence confirmation from provisioner"),
+	TEST_CASE(provisioner, confirm_after_caps,
+		  "Provisioner: sends confirmation PDU right after receiving capabilities"),
+	TEST_CASE(device, confirm_after_start,
+		  "Device: provisioning fails, CONFIRM injected right after Start (expects PUB_KEY)"),
+	TEST_CASE(provisioner, confirm_after_start,
+		  "Provisioner: injects CONFIRM right after Start, before public key exchange"),
+	TEST_CASE(device, double_confirm,
+		  "Device: provisioning fails, CONFIRM received instead of RANDOM (double-confirm)"),
+	TEST_CASE(provisioner, double_confirm,
+		  "Provisioner: sends second CONFIRM instead of Random after confirm exchange"),
+	TEST_CASE(device, confirm_instead_of_data,
+		  "Device: provisioning fails, CONFIRM received instead of Provisioning Data"),
+	TEST_CASE(provisioner, confirm_instead_of_data,
+		  "Provisioner: sends CONFIRM instead of Data after full Random exchange"),
+	TEST_CASE(device, invalid_confirm,
+		  "Device: provisioning fails due to invalid confirmation from provisioner"),
+	TEST_CASE(provisioner, invalid_confirm,
+		  "Provisioner: sends hardcoded invalid confirmation value"),
+
 	BSTEST_END_MARKER
 };
+#else
+static const struct bst_test_instance test_connect_pst[] = {
+	TEST_CASE(device, confirm_after_caps,
+		  "Device: provisioning fails due to out-of-sequence confirmation from provisioner"),
+	TEST_CASE(provisioner, confirm_after_caps,
+		  "Provisioner: sends confirmation PDU right after receiving capabilities"),
+	TEST_CASE(device, confirm_after_start,
+		  "Device: provisioning fails, CONFIRM injected right after Start (expects PUB_KEY)"),
+	TEST_CASE(provisioner, confirm_after_start,
+		  "Provisioner: injects CONFIRM right after Start, before public key exchange"),
+	TEST_CASE(device, double_confirm,
+		  "Device: provisioning fails, CONFIRM received instead of RANDOM (double-confirm)"),
+	TEST_CASE(provisioner, double_confirm,
+		  "Provisioner: sends second CONFIRM instead of Random after confirm exchange"),
+	TEST_CASE(device, confirm_instead_of_data,
+		  "Device: provisioning fails, CONFIRM received instead of Provisioning Data"),
+	TEST_CASE(provisioner, confirm_instead_of_data,
+		  "Provisioner: sends CONFIRM instead of Data after full Random exchange"),
+	TEST_CASE(device, invalid_confirm,
+		  "Device: provisioning fails due to invalid confirmation from provisioner"),
+	TEST_CASE(provisioner, invalid_confirm,
+		  "Provisioner: sends hardcoded invalid confirmation value"),
+
+	BSTEST_END_MARKER
+};
+#endif /* IS_RPR_PRESENT */
 
 struct bst_test_list *test_provision_pst_install(struct bst_test_list *tests)
 {
 	tests = bst_add_tests(tests, test_connect_pst);
 	return tests;
 }
-#endif /* IS_RPR_PRESENT */

@@ -21,6 +21,12 @@
 
 static sys_slist_t cb_slist;
 
+const uint8_t *bt_mesh_prov_test_confirm_val;
+bool bt_mesh_prov_test_send_confirm_on_caps;
+bool bt_mesh_prov_test_send_confirm_on_start;
+bool bt_mesh_prov_test_double_confirm;
+bool bt_mesh_prov_test_send_confirm_on_data;
+
 int bt_mesh_test_cb_register(struct bt_mesh_test_cb *cb)
 {
 	if (sys_slist_find(&cb_slist, &cb->node, NULL)) {

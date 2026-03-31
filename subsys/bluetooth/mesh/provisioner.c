@@ -20,6 +20,10 @@
 
 #include "common/bt_str.h"
 
+#if defined(CONFIG_BT_TESTING)
+#include "testing.h"
+#endif
+
 #include "crypto.h"
 #include "mesh.h"
 #include "net.h"
@@ -99,8 +103,36 @@ static void send_invite(void)
 	bt_mesh_prov_link.expect = PROV_CAPABILITIES;
 }
 
+#if defined(CONFIG_BT_TESTING)
+/* Send a raw Confirmation PDU for out-of-sequence injection tests.
+ * Uses bt_mesh_prov_test_confirm_val bytes when set, all-zeros otherwise.
+ * The content is irrelevant for tests that check type-level rejection.
+ */
+static void send_raw_confirm(void)
+{
+	PROV_BUF(cfm, PDU_LEN_CONFIRM);
+	uint8_t auth_size = bt_mesh_prov_auth_size_get();
+	static const uint8_t zeros[PROV_AUTH_MAX_LEN];
+	const uint8_t *val = bt_mesh_prov_test_confirm_val ?
+				bt_mesh_prov_test_confirm_val : zeros;
+
+	bt_mesh_prov_buf_init(&cfm, PROV_CONFIRM);
+	net_buf_simple_add_mem(&cfm, val, auth_size);
+
+	if (bt_mesh_prov_send(&cfm, NULL)) {
+		LOG_ERR("Failed to send raw Provisioning Confirm");
+	}
+}
+#endif /* CONFIG_BT_TESTING */
+
 static void start_sent(int err, void *cb_data)
 {
+#if defined(CONFIG_BT_TESTING)
+	if (bt_mesh_prov_test_send_confirm_on_start) {
+		send_raw_confirm();
+		return;
+	}
+#endif
 	send_pub_key();
 }
 
@@ -200,6 +232,8 @@ static bool prov_check_method(struct bt_mesh_dev_capabilities *caps)
 
 	return true;
 }
+
+static void send_confirm(void);
 
 static void prov_capabilities(const uint8_t *data)
 {
@@ -305,6 +339,13 @@ static void prov_capabilities(const uint8_t *data)
 		return;
 	}
 
+#if defined(CONFIG_BT_TESTING)
+	if (bt_mesh_prov_test_send_confirm_on_caps) {
+		send_confirm();
+		return;
+	}
+#endif
+
 	send_start();
 }
 
@@ -366,7 +407,14 @@ static void send_confirm(void)
 		return;
 	}
 
-	net_buf_simple_add_mem(&cfm, bt_mesh_prov_link.conf, auth_size);
+#if defined(CONFIG_BT_TESTING)
+	if (bt_mesh_prov_test_confirm_val) {
+		net_buf_simple_add_mem(&cfm, bt_mesh_prov_test_confirm_val, auth_size);
+	} else
+#endif
+	{
+		net_buf_simple_add_mem(&cfm, bt_mesh_prov_link.conf, auth_size);
+	}
 
 	if (bt_mesh_prov_send(&cfm, NULL)) {
 		LOG_ERR("Failed to send Provisioning Confirm");
@@ -664,6 +712,13 @@ static void prov_random(const uint8_t *data)
 
 	LOG_DBG("ProvisioningSalt: %s", bt_hex(bt_mesh_prov_link.prov_salt, 16));
 
+#if defined(CONFIG_BT_TESTING)
+	if (bt_mesh_prov_test_send_confirm_on_data) {
+		send_raw_confirm();
+		return;
+	}
+#endif
+
 	send_prov_data();
 }
 
@@ -680,6 +735,13 @@ static void prov_confirm(const uint8_t *data)
 	}
 
 	memcpy(bt_mesh_prov_link.conf, data, conf_size);
+
+#if defined(CONFIG_BT_TESTING)
+	if (bt_mesh_prov_test_double_confirm) {
+		send_raw_confirm();
+		return;
+	}
+#endif
 
 	send_random();
 }

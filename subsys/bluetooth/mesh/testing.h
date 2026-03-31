@@ -85,3 +85,34 @@ void bt_mesh_test_model_bound(uint16_t addr, const struct bt_mesh_model *model, 
 void bt_mesh_test_model_unbound(uint16_t addr, const struct bt_mesh_model *model, uint16_t key_idx);
 void bt_mesh_test_prov_invalid_bearer(uint8_t opcode);
 void bt_mesh_test_trans_incomp_timer_exp(void);
+
+/** Pointer to override confirmation value sent by the provisioner during provisioning.
+ *  When non-NULL, this value is sent instead of the computed confirmation.
+ *  Must point to a buffer of at least bt_mesh_prov_auth_size_get() bytes.
+ */
+extern const uint8_t *bt_mesh_prov_test_confirm_val;
+
+/** When true, the provisioner sends the confirmation PDU immediately after
+ *  receiving the Capabilities PDU (out-of-sequence attack).
+ */
+extern bool bt_mesh_prov_test_send_confirm_on_caps;
+
+/** When true, the provisioner injects a raw Confirmation PDU right after
+ *  sending Start (before the public key exchange).  The provisionee expects
+ *  PUB_KEY at that point and will reject it with PROV_ERR_UNEXP_PDU.
+ */
+extern bool bt_mesh_prov_test_send_confirm_on_start;
+
+/** When true, the provisioner sends a second raw Confirmation PDU right after
+ *  receiving the provisionee's Confirmation (instead of sending Random).
+ *  The provisionee expects RANDOM at that point and will reject it with
+ *  PROV_ERR_UNEXP_PDU.
+ */
+extern bool bt_mesh_prov_test_double_confirm;
+
+/** When true, the provisioner injects a raw Confirmation PDU after the full
+ *  Confirmation+Random exchange has completed successfully.  The provisionee
+ *  expects Provisioning Data at that point and will reject it with
+ *  PROV_ERR_UNEXP_PDU.
+ */
+extern bool bt_mesh_prov_test_send_confirm_on_data;
