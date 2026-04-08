@@ -38,6 +38,8 @@
 		zephyr,flash = &flash0;
 		/* UART used by the BT controller UART HCI driver by default: */
 		zephyr,bt-c2h-uart = &uart1;
+		/* Use Zephyr LL instead of SoftDevice controller */
+		zephyr,bt-hci = &bt_hci_controller;
 	};
 
 	soc {
@@ -66,6 +68,14 @@
 &radio {
 	/* These features are not yet supported by the RADIO model */
 	/delete-property/ dfe-supported;
+};
+
+&bt_hci_controller {
+	status = "okay";
+};
+
+&bt_hci_sdc {
+	status = "disabled";
 };
 
 &gpiote {
